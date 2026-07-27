@@ -1,0 +1,7 @@
+name = "barresto"
+main = "worker.js"
+compatibility_date = "2024-11-01"
+
+[[kv_namespaces]]
+binding = "SALONS"
+id = "c464b37e1df54f30a0d99153bc7f3b2a"
