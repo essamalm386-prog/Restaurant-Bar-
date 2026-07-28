@@ -5,12 +5,14 @@
    à Cloudflare. Le binding KV « SALONS » sert aux deux usages, avec des
    préfixes de clés distincts (liaison éphémère / ventes durables).
 
-   Secrets à définir dans le Worker (Settings → Variables → Encrypt) :
-     LIC_SEL        le sel qui fabrique les licences
-     CINETPAY_KEY   apikey CinetPay
-     CINETPAY_SITE  site_id CinetPay
-     ADMIN_CLE      mot de passe de votre tableau de bord
-     SITE_VENTE     adresse de la page de vente (pour les retours de paiement)
+   Deux secrets à définir dans le Worker (Settings → Variables → Encrypt) :
+     LIC_SEL     le sel qui fabrique les licences — jamais en clair ici,
+                 ce dépôt étant public, quiconque le lirait pourrait créer des clés
+     ADMIN_CLE   mot de passe de votre tableau de bord
+
+   Facultatifs : MOMO_NUMERO, MOMO_NOM et SITE_VENTE remplacent les valeurs
+   par défaut ci-dessous. CINETPAY_KEY et CINETPAY_SITE, s'ils sont renseignés,
+   font basculer la boutique du règlement direct vers l'encaissement automatique.
    ========================================================================= */
 
 const RETENTION = 10800;            /* liaison : 3 h */
@@ -30,6 +32,10 @@ const BONUS_PARRAIN  = 1;            /* mois offerts à celui qui l'a donné */
 /* Coordonnées d'encaissement. Publiques par nature : elles s'affichent sur la
    boutique. Les secrets MOMO_NUMERO / MOMO_NOM les remplacent si définis. */
 const MOMO_DEFAUT = { numero: '655 01 47 92', nom: 'Louis Marie ESSAMA' };
+
+/* Adresse de la boutique, où le client est renvoyé après paiement.
+   Publique elle aussi ; le secret SITE_VENTE la remplace si besoin. */
+const SITE_DEFAUT = 'https://effortless-bonbon-5dd272.netlify.app';
 
 /* ------------------------------------------------------------------ */
 /*  Utilitaires                                                        */
@@ -197,7 +203,7 @@ async function acheter(req, env, origine) {
   }
 
   const id = ref();
-  const site = env.SITE_VENTE || origine;
+  const site = env.SITE_VENTE || SITE_DEFAUT || origine;
   await env.SALONS.put('v:cmd:' + id,
     JSON.stringify({ id, etab, tel, formule: b.formule, mois: f.mois, montant: f.prix,
                      parrainTel, etat: 'attente', date: new Date().toISOString() }),
