@@ -81,6 +81,34 @@ function fabriquerCle(sel, client, exp) {
   const sig = hashStr(sel + '|' + client.toUpperCase() + '|' + exp).slice(0, 10);
   return 'BARLIC.' + b64enc(JSON.stringify([client, exp, sig]));
 }
+
+function hash32(str, graine) {
+  let h = graine >>> 0;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  h ^= h >>> 16; h = Math.imul(h, 0x7feb352d) >>> 0;
+  h ^= h >>> 15; h = Math.imul(h, 0x846ca68b) >>> 0;
+  return (h ^ (h >>> 16)) >>> 0;
+}
+/* Empreinte du sel attendu. Ce n'est pas le sel : on ne peut pas le
+   reconstituer à partir d'elle, mais elle permet au Worker de vérifier
+   qu'il détient le bon. Sans cette garde, un secret absent ou collé avec
+   une espace produisait des clés d'apparence normale, que l'application
+   refusait ensuite sans que personne comprenne pourquoi. */
+const SEL_EMPREINTE = '76D8C994';
+function empreinte(sel) {
+  return hash32(sel, 0x5eed1234).toString(16).toUpperCase().padStart(8, '0');
+}
+/* Renvoie le sel utilisable, ou null s'il est absent ou incorrect. */
+function selUtilisable(env) {
+  const sel = String(env.LIC_SEL || '').trim();
+  if (!sel || empreinte(sel) !== SEL_EMPREINTE) return null;
+  return sel;
+}
+const ERREUR_SEL = { erreur: "La délivrance des licences est momentanément indisponible. "
+                            + "Écrivez-nous, votre demande sera honorée." };
 const nettoyerTel = t => String(t || '').replace(/[^\d+]/g, '').slice(0, 20);
 const nettoyerNom = n => String(n || '').trim().replace(/[<>|]/g, '').slice(0, 60);
 const ref = () => 'JRB' + Date.now().toString(36).toUpperCase()
@@ -97,16 +125,6 @@ const fmtF = n => Number(n || 0).toLocaleString('fr-FR').replace(/[\s\u00a0\u202
 const ALPHA_CODE = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 /* Hachage propre — surtout pas celui des licences, dont les bits de poids
    faible sont dégradés par la multiplication qui déborde volontairement. */
-function hash32(str, graine) {
-  let h = graine >>> 0;
-  for (let i = 0; i < str.length; i++) {
-    h ^= str.charCodeAt(i);
-    h = Math.imul(h, 0x01000193) >>> 0;
-  }
-  h ^= h >>> 16; h = Math.imul(h, 0x7feb352d) >>> 0;
-  h ^= h >>> 15; h = Math.imul(h, 0x846ca68b) >>> 0;
-  return (h ^ (h >>> 16)) >>> 0;
-}
 function codeParrain(tel, variante) {
   const sel = 'parrain|' + tel + (variante ? '|' + variante : '');
   let a = hash32(sel, 0x811c9dc5), b = hash32(sel, 0x9e3779b9), s = '';
@@ -139,7 +157,9 @@ async function recompenserParrain(env, telParrain, filleul) {
   const v = JSON.parse(brut);
   const base = v.exp > moisPlus(0) ? v.exp : moisPlus(0);
   const exp = prolonger(base, BONUS_PARRAIN);
-  const maj = { ...v, exp, cle: fabriquerCle(env.LIC_SEL, v.etab, exp) };
+  const sel = selUtilisable(env);
+  if (!sel) return;
+  const maj = { ...v, exp, cle: fabriquerCle(sel, v.etab, exp) };
   await env.SALONS.put('v:tel:' + telParrain, JSON.stringify(maj));
   const bl = await env.SALONS.get('v:filleuls:' + telParrain);
   const liste = bl ? JSON.parse(bl) : [];
@@ -173,8 +193,10 @@ async function essai(req, env) {
     const o = JSON.parse(deja);
     return json(200, { cle: o.cle, exp: o.exp, etab: o.etab, rappel: true });
   }
+  const sel = selUtilisable(env);
+  if (!sel) return json(503, ERREUR_SEL);
   const exp = moisPlus(2).slice(0, 7);          /* fin du mois prochain */
-  const cle = fabriquerCle(env.LIC_SEL, etab, exp);
+  const cle = fabriquerCle(sel, etab, exp);
   const o = { cle, exp, etab, tel, type: 'essai', date: new Date().toISOString() };
   await env.SALONS.put('v:essai:' + tel, JSON.stringify(o));
   await env.SALONS.put('v:tel:' + tel, JSON.stringify(o));
@@ -267,8 +289,10 @@ async function emettre(env, id) {
     const prec = JSON.parse(ancien).exp;
     if (prec && prec > base) base = prec;
   }
+  const sel = selUtilisable(env);
+  if (!sel) return null;                        /* rien plutôt qu'une clé morte */
   const exp = prolonger(base, cmd.mois + bonus);
-  const cle = fabriquerCle(env.LIC_SEL, cmd.etab, exp);
+  const cle = fabriquerCle(sel, cmd.etab, exp);
   const code = await attribuerCode(env, cmd.tel);          /* il peut parrainer à son tour */
   const vente = { ref: id, cle, exp, etab: cmd.etab, tel: cmd.tel,
                   formule: cmd.formule, montant: cmd.montant, bonus,
@@ -360,6 +384,9 @@ async function valider(url, req, env) {
     await env.SALONS.put('v:refus:' + id, '1', { expirationTtl: 86400 * 30 });
     return json(200, { ok: true, refuse: true });
   }
+  if (!selUtilisable(env))
+    return json(503, { erreur: "Le secret LIC_SEL est absent ou incorrect dans Cloudflare : "
+                             + "aucune licence ne peut être émise. Corrigez-le puis revalidez." });
   const v = await emettre(env, id);
   if (!v) return json(404, { erreur: 'Commande introuvable ou déjà traitée.' });
   return json(200, { ok: true, cle: v.cle, exp: v.exp });
@@ -547,6 +574,18 @@ export default {
       if (chemin === '/vente/parrainage' && req.method === 'GET') return parrainage(u, env);
       if (chemin === '/vente/code' && req.method === 'GET') return verifierCode(u, env);
       if (chemin === '/vente/admin'  && req.method === 'GET')  return admin(u, env);
+      /* Contrôle de configuration : dit en clair ce qui manque, sans exposer
+         aucun secret. Accessible sans mot de passe, car il ne révèle rien. */
+      if (chemin === '/vente/verif' && req.method === 'GET') {
+        const sel = selUtilisable(env);
+        return json(200, {
+          licences: sel ? 'ok' : (env.LIC_SEL ? 'LIC_SEL incorrect' : 'LIC_SEL absent'),
+          tableauDeBord: env.ADMIN_CLE ? 'ok' : 'ADMIN_CLE absent',
+          encaissement: (env.CINETPAY_KEY && env.CINETPAY_SITE) ? 'automatique' : 'direct',
+          stockage: env.SALONS ? 'ok' : 'binding SALONS absent',
+          pret: !!(sel && env.ADMIN_CLE && env.SALONS)
+        });
+      }
 
       /* ---------------- serveur de liaison ------------- */
       if (chemin === '/' || chemin === '/sante') return json(200, { ok: true, service: 'liaison' });
