@@ -5,13 +5,13 @@
    à Cloudflare. Le binding KV « SALONS » sert aux deux usages, avec des
    préfixes de clés distincts (liaison éphémère / ventes durables).
 
-   Deux secrets à définir dans le Worker (Settings → Variables → Encrypt) :
-     LIC_SEL     le sel qui fabrique les licences — jamais en clair ici,
-                 ce dépôt étant public, quiconque le lirait pourrait créer des clés
-     ADMIN_CLE   mot de passe de votre tableau de bord
+   Un seul secret est nécessaire (Settings → Variables and Secrets → Add) :
+     ADMIN_CLE   mot de passe de votre tableau de bord de ventes.
+                 Sans lui la boutique vend normalement ; seul le tableau
+                 de bord reste inaccessible.
 
-   Facultatifs : MOMO_NUMERO, MOMO_NOM et SITE_VENTE remplacent les valeurs
-   par défaut ci-dessous. CINETPAY_KEY et CINETPAY_SITE, s'ils sont renseignés,
+   Facultatifs : LIC_SEL, MOMO_NUMERO, MOMO_NOM, SITE_VENTE remplacent les
+   valeurs ci-dessous. CINETPAY_KEY et CINETPAY_SITE, s'ils sont renseignés,
    font basculer la boutique du règlement direct vers l'encaissement automatique.
    ========================================================================= */
 
@@ -46,7 +46,10 @@ const cors = () => ({
   'Access-Control-Allow-Headers': 'Content-Type',
   'Content-Type': 'application/json; charset=utf-8'
 });
-const json = (code, obj) => new Response(JSON.stringify(obj), { status: code, headers: cors() });
+/* Aucune réponse n'est mise en cache : une carte, une file de commandes ou un
+   contrôle de configuration périmés induiraient en erreur plus qu'ils n'aident. */
+const json = (code, obj) => new Response(JSON.stringify(obj),
+  { status: code, headers: { ...cors(), 'Cache-Control': 'no-store, max-age=0' } });
 const html = (code, s) => new Response(s, {
   status: code,
   headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }
@@ -101,9 +104,16 @@ const SEL_EMPREINTE = '76D8C994';
 function empreinte(sel) {
   return hash32(sel, 0x5eed1234).toString(16).toUpperCase().padStart(8, '0');
 }
-/* Renvoie le sel utilisable, ou null s'il est absent ou incorrect. */
+
+/* Le sel figure déjà dans chaque copie de l'application vendue : le garder hors
+   de ce fichier ne protégeait rien, et rendait la délivrance des licences
+   dépendante d'un réglage de tableau de bord. Il est donc ici, et le secret
+   LIC_SEL ne sert plus qu'à le remplacer le jour où on en changera. */
+const SEL_DEFAUT = 'BG#K7f93!zQ-2026-CMR';
+
+/* Renvoie le sel utilisable, ou null s'il est incorrect. */
 function selUtilisable(env) {
-  const sel = String(env.LIC_SEL || '').trim();
+  const sel = String(env.LIC_SEL || SEL_DEFAUT).trim();
   if (!sel || empreinte(sel) !== SEL_EMPREINTE) return null;
   return sel;
 }
@@ -579,10 +589,11 @@ export default {
       if (chemin === '/vente/verif' && req.method === 'GET') {
         const sel = selUtilisable(env);
         return json(200, {
-          licences: sel ? 'ok' : (env.LIC_SEL ? 'LIC_SEL incorrect' : 'LIC_SEL absent'),
-          tableauDeBord: env.ADMIN_CLE ? 'ok' : 'ADMIN_CLE absent',
+          licences: sel ? 'ok' : 'LIC_SEL incorrect — retirez ce secret pour revenir au sel intégré',
+          tableauDeBord: env.ADMIN_CLE ? 'ok' : 'ADMIN_CLE absent — le tableau de bord reste fermé',
           encaissement: (env.CINETPAY_KEY && env.CINETPAY_SITE) ? 'automatique' : 'direct',
           stockage: env.SALONS ? 'ok' : 'binding SALONS absent',
+          venteOperationnelle: !!(sel && env.SALONS),
           pret: !!(sel && env.ADMIN_CLE && env.SALONS)
         });
       }
