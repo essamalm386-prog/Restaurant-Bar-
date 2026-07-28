@@ -380,7 +380,8 @@ async function declarer(req, env) {
 
 /* Le vendeur confirme avoir vu l'argent arriver : la licence est émise. */
 async function valider(url, req, env) {
-  if (!env.ADMIN_CLE || url.searchParams.get('k') !== env.ADMIN_CLE)
+  const attendu = await motDePasseAdmin(env);
+  if (!attendu || url.searchParams.get('k') !== attendu)
     return json(401, { erreur: 'Accès refusé.' });
   const b = await req.json();
   const id = String(b.id || '');
@@ -451,9 +452,88 @@ async function verifierCode(url, env) {
 /* ------------------------------------------------------------------ */
 /*  Tableau de bord privé                                              */
 /* ------------------------------------------------------------------ */
+/* Mot de passe du tableau de bord. Le secret Cloudflare prime s'il existe ;
+   sinon on lit celui que le vendeur a choisi lui-même, rangé dans le KV.
+   Cela évite de dépendre d'un réglage de tableau de bord tiers. */
+async function motDePasseAdmin(env) {
+  if (env.ADMIN_CLE) return String(env.ADMIN_CLE).trim();
+  return await env.SALONS.get('v:admincle');
+}
+
+/* Écran commun : première mise en place, ou simple demande du mot de passe. */
+function pageAcces(premiere, message) {
+  return html(premiere ? 200 : 401, `<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Jaraba — tableau de bord</title><style>
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;
+background:#E8E9EC;color:#1B1C1E;display:flex;align-items:center;justify-content:center;
+min-height:100dvh;padding:22px}
+.b{background:#fff;border-radius:26px;padding:28px 24px;max-width:420px;width:100%;
+box-shadow:0 12px 40px rgba(5,29,56,.12)}
+h1{font-size:23px;font-weight:800;margin:0 0 6px;letter-spacing:-.4px}
+p{color:#7A7D84;font-size:15px;margin:0 0 18px;line-height:1.55}
+label{display:block;font-size:11.5px;font-weight:700;color:#7A7D84;text-transform:uppercase;
+letter-spacing:.5px;margin-bottom:6px}
+input{width:100%;padding:15px 17px;border:none;border-radius:15px;font-size:16.5px;
+font-family:inherit;background:#E8E9EC;color:#1B1C1E;margin-bottom:14px;box-sizing:border-box}
+input:focus{outline:2px solid #C99948}
+button{width:100%;border:none;border-radius:999px;padding:15px;font-size:16px;font-weight:700;
+font-family:inherit;cursor:pointer;background:#C99948;color:#241905;min-height:52px}
+.av{background:#F5EDDE;color:#8E6B2F;border-radius:14px;padding:13px 15px;font-size:14px;
+font-weight:600;margin-bottom:16px;line-height:1.5}
+.ko{background:#FAE8E5;color:#7C241A;border-radius:14px;padding:13px 15px;font-size:14.5px;
+font-weight:600;margin-bottom:16px}
+</style></head><body><div class="b">
+${message ? '<div class="ko">' + esc(message) + '</div>' : ''}
+${premiere ? `<h1>Protégez votre tableau de bord</h1>
+  <p>Personne n'a encore choisi de mot de passe. Choisissez-en un maintenant : il sera
+     demandé à chaque accès, et vous seul pourrez le changer ensuite.</p>
+  <div class="av">Faites-le tout de suite : tant que ce mot de passe n'est pas posé,
+     quiconque connaît cette adresse pourrait le choisir à votre place.</div>
+  <form method="POST" action="/vente/admin-cle">
+    <label for="n">Mot de passe</label>
+    <input type="text" id="n" name="nouveau" placeholder="au moins 6 caractères" autofocus>
+    <button type="submit">Enregistrer</button>
+  </form>`
+: `<h1>Tableau de bord</h1>
+  <p>Entrez le mot de passe que vous avez choisi.</p>
+  <form method="GET" action="/vente/admin">
+    <label for="k">Mot de passe</label>
+    <input type="password" id="k" name="k" autofocus>
+    <button type="submit">Ouvrir</button>
+  </form>`}
+</div></body></html>`);
+}
+
+/* Pose le mot de passe la première fois, ou le remplace si l'ancien est fourni. */
+async function definirClehAdmin(req, env) {
+  if (env.ADMIN_CLE)
+    return html(400, '<meta charset="utf-8"><p style="font-family:sans-serif">'
+      + 'Le mot de passe est fixé par le secret ADMIN_CLE dans Cloudflare : '
+      + 'retirez-le pour pouvoir le choisir ici.</p>');
+  let d = {};
+  try {
+    const ct = req.headers.get('content-type') || '';
+    if (ct.includes('json')) d = await req.json();
+    else { const f = await req.formData(); d = { nouveau: f.get('nouveau'), actuel: f.get('actuel') }; }
+  } catch (e) { /* corps illisible */ }
+
+  const nouveau = String(d.nouveau || '').trim();
+  if (nouveau.length < 6) return pageAcces(true, 'Choisissez au moins six caractères.');
+
+  const existant = await env.SALONS.get('v:admincle');
+  if (existant && String(d.actuel || '').trim() !== existant)
+    return pageAcces(false, 'Un mot de passe est déjà en place. Entrez-le pour le remplacer.');
+
+  await env.SALONS.put('v:admincle', nouveau);
+  return new Response(null, { status: 303,
+    headers: { Location: '/vente/admin?k=' + encodeURIComponent(nouveau) } });
+}
+
 async function admin(url, env) {
-  if (!env.ADMIN_CLE || url.searchParams.get('k') !== env.ADMIN_CLE)
-    return html(401, '<meta charset="utf-8"><p style="font-family:sans-serif">Accès refusé.</p>');
+  const attendu = await motDePasseAdmin(env);
+  if (!attendu) return pageAcces(true, '');
+  if (url.searchParams.get('k') !== attendu) return pageAcces(false, '');
 
   const brut = await env.SALONS.get('v:index');
   const liste = brut ? JSON.parse(brut) : [];
@@ -584,17 +664,19 @@ export default {
       if (chemin === '/vente/parrainage' && req.method === 'GET') return parrainage(u, env);
       if (chemin === '/vente/code' && req.method === 'GET') return verifierCode(u, env);
       if (chemin === '/vente/admin'  && req.method === 'GET')  return admin(u, env);
+      if (chemin === '/vente/admin-cle' && req.method === 'POST') return definirClehAdmin(req, env);
       /* Contrôle de configuration : dit en clair ce qui manque, sans exposer
          aucun secret. Accessible sans mot de passe, car il ne révèle rien. */
       if (chemin === '/vente/verif' && req.method === 'GET') {
         const sel = selUtilisable(env);
+        const mdp = await motDePasseAdmin(env);
         return json(200, {
           licences: sel ? 'ok' : 'LIC_SEL incorrect — retirez ce secret pour revenir au sel intégré',
-          tableauDeBord: env.ADMIN_CLE ? 'ok' : 'ADMIN_CLE absent — le tableau de bord reste fermé',
+          tableauDeBord: mdp ? 'protégé' : 'mot de passe à choisir sur /vente/admin',
           encaissement: (env.CINETPAY_KEY && env.CINETPAY_SITE) ? 'automatique' : 'direct',
           stockage: env.SALONS ? 'ok' : 'binding SALONS absent',
           venteOperationnelle: !!(sel && env.SALONS),
-          pret: !!(sel && env.ADMIN_CLE && env.SALONS)
+          pret: !!(sel && env.SALONS)
         });
       }
 
