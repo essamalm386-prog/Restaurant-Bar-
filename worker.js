@@ -18,13 +18,18 @@ const CP_API    = 'https://api-checkout.cinetpay.com/v2';
 
 /* ---- Catalogue commercial : modifiable sans toucher au reste ------------ */
 const FORMULES = {
-  m1:  { mois: 1,  prix: 5000,  titre: '1 mois' },
-  m6:  { mois: 6,  prix: 25000, titre: '6 mois' },
-  m12: { mois: 12, prix: 40000, titre: '12 mois' }
+  m1:  { mois: 1,  prix: 1000,  titre: '1 mois' },
+  m6:  { mois: 6,  prix: 5000,  titre: '6 mois' },
+  m12: { mois: 12, prix: 10000, titre: '12 mois' },
+  m24: { mois: 24, prix: 15000, titre: '2 ans' }
 };
 const DEVISE = 'XAF';
 const BONUS_FILLEUL = 1;            /* mois offerts à celui qui utilise un code */
 const BONUS_PARRAIN  = 1;            /* mois offerts à celui qui l'a donné */
+
+/* Coordonnées d'encaissement. Publiques par nature : elles s'affichent sur la
+   boutique. Les secrets MOMO_NUMERO / MOMO_NOM les remplacent si définis. */
+const MOMO_DEFAUT = { numero: '655 01 47 92', nom: 'Louis Marie ESSAMA' };
 
 /* ------------------------------------------------------------------ */
 /*  Utilitaires                                                        */
@@ -76,7 +81,9 @@ const ref = () => 'JRB' + Date.now().toString(36).toUpperCase()
                  + Math.random().toString(36).slice(2, 6).toUpperCase();
 const esc = s => String(s == null ? '' : s)
   .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-const fmtF = n => Number(n || 0).toLocaleString('fr-FR').replace(/ | /g, ' ') + ' F';
+/* Selon l'environnement, toLocaleString sépare les milliers par une espace fine
+   insécable (U+202F) ou insécable (U+00A0) : on ramène tout à une espace simple. */
+const fmtF = n => Number(n || 0).toLocaleString('fr-FR').replace(/[\s\u00a0\u202f]+/g, ' ') + ' F';
 
 /* ---- Parrainage ---------------------------------------------------
    Le code est tiré du numéro : toujours le même pour un client donné,
@@ -235,25 +242,14 @@ async function notify(req, env) {
   return json(200, { ok: true });
 }
 
-/* Vérifie auprès de CinetPay puis fabrique et range la licence. Idempotent. */
-async function livrer(env, id) {
+/* Fabrique et range la licence. Point de passage unique : que le paiement ait
+   été confirmé par l'opérateur ou validé à la main, tout aboutit ici. */
+async function emettre(env, id) {
   const dejaVendu = await env.SALONS.get('v:paye:' + id);
   if (dejaVendu) return JSON.parse(dejaVendu);
-
   const brut = await env.SALONS.get('v:cmd:' + id);
   if (!brut) return null;
   const cmd = JSON.parse(brut);
-
-  const r = await fetch(CP_API + '/payment/check', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ apikey: env.CINETPAY_KEY, site_id: env.CINETPAY_SITE, transaction_id: id })
-  });
-  const j = await r.json().catch(() => ({}));
-  const st = (j && j.data && j.data.status) || (j && j.code) || '';
-  if (!(st === 'ACCEPTED' || st === '00' || st === 'SUCCES')) return null;
-
-  const montant = Number((j.data && j.data.amount) || 0);
-  if (montant && montant < cmd.montant) return null;       /* montant insuffisant : on ne livre pas */
 
   /* On repart de ce qui reste, jamais du mois courant : racheter tôt ne doit
      jamais raccourcir une licence en cours. */
@@ -276,8 +272,91 @@ async function livrer(env, id) {
   if (cmd.parrainTel) await recompenserParrain(env, cmd.parrainTel, cmd.etab);
   await ajouterIndex(env, { ref: id, etab: cmd.etab, tel: cmd.tel,
                             formule: (FORMULES[cmd.formule] || {}).titre || cmd.formule,
-                            montant: cmd.montant, exp, parraine: !!cmd.parrainTel, date: vente.date });
+                            montant: cmd.montant, exp, parraine: !!cmd.parrainTel,
+                            mode: cmd.mode || 'auto', date: vente.date });
   return vente;
+}
+
+/* Chemin automatique : le statut est revérifié en direct auprès de l'encaisseur
+   avant toute livraison. La notification n'est jamais crue sur parole. */
+async function livrer(env, id) {
+  const dejaVendu = await env.SALONS.get('v:paye:' + id);
+  if (dejaVendu) return JSON.parse(dejaVendu);
+  const brut = await env.SALONS.get('v:cmd:' + id);
+  if (!brut) return null;
+  const cmd = JSON.parse(brut);
+  if (cmd.mode === 'direct') return null;      /* validation humaine attendue */
+  if (!env.CINETPAY_KEY) return null;
+
+  const r = await fetch(CP_API + '/payment/check', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ apikey: env.CINETPAY_KEY, site_id: env.CINETPAY_SITE, transaction_id: id })
+  });
+  const j = await r.json().catch(() => ({}));
+  const st = (j && j.data && j.data.status) || (j && j.code) || '';
+  if (!(st === 'ACCEPTED' || st === '00' || st === 'SUCCES')) return null;
+
+  const montant = Number((j.data && j.data.amount) || 0);
+  if (montant && montant < cmd.montant) return null;   /* montant insuffisant : on ne livre pas */
+  return emettre(env, id);
+}
+
+/* ---- Encaissement direct, sans agrégateur -------------------------
+   Le client envoie l'argent sur le Mobile Money du vendeur, puis déclare
+   sa référence. Le vendeur confirme d'un geste depuis son tableau de bord
+   et la clé part toute seule. Aucune inscription d'entreprise requise. */
+async function declarer(req, env) {
+  const b = await req.json();
+  const etab = nettoyerNom(b.etab);
+  const tel  = nettoyerTel(b.tel);
+  const f    = FORMULES[b.formule];
+  const refPaie = String(b.refPaiement || '').trim().replace(/[<>|]/g, '').slice(0, 40);
+  if (!etab) return json(400, { erreur: "Indiquez le nom de votre établissement." });
+  if (tel.length < 8) return json(400, { erreur: 'Indiquez un numéro de téléphone valide.' });
+  if (!f) return json(400, { erreur: 'Formule inconnue.' });
+  if (refPaie.length < 4)
+    return json(400, { erreur: "Recopiez l'identifiant du message de confirmation de votre paiement." });
+
+  let parrainTel = '';
+  const code = String(b.parrain || '').trim().toUpperCase();
+  if (code) {
+    const t = await env.SALONS.get('v:parr:' + code);
+    if (t && t !== tel) parrainTel = t;
+  }
+  const id = ref();
+  await env.SALONS.put('v:cmd:' + id, JSON.stringify({
+    id, etab, tel, formule: b.formule, mois: f.mois, montant: f.prix,
+    parrainTel, mode: 'direct', refPaie, etat: 'a-verifier',
+    date: new Date().toISOString()
+  }), { expirationTtl: 86400 * 30 });
+
+  const bl = await env.SALONS.get('v:attente');
+  const liste = bl ? JSON.parse(bl) : [];
+  liste.unshift({ id, etab, tel, refPaie, montant: f.prix,
+                  formule: f.titre, date: new Date().toISOString() });
+  await env.SALONS.put('v:attente', JSON.stringify(liste.slice(0, 500)));
+  return json(200, { ok: true, ref: id });
+}
+
+/* Le vendeur confirme avoir vu l'argent arriver : la licence est émise. */
+async function valider(url, req, env) {
+  if (!env.ADMIN_CLE || url.searchParams.get('k') !== env.ADMIN_CLE)
+    return json(401, { erreur: 'Accès refusé.' });
+  const b = await req.json();
+  const id = String(b.id || '');
+  const refuser = !!b.refuser;
+
+  const bl = await env.SALONS.get('v:attente');
+  const liste = (bl ? JSON.parse(bl) : []).filter(x => x.id !== id);
+  await env.SALONS.put('v:attente', JSON.stringify(liste));
+
+  if (refuser) {
+    await env.SALONS.put('v:refus:' + id, '1', { expirationTtl: 86400 * 30 });
+    return json(200, { ok: true, refuse: true });
+  }
+  const v = await emettre(env, id);
+  if (!v) return json(404, { erreur: 'Commande introuvable ou déjà traitée.' });
+  return json(200, { ok: true, cle: v.cle, exp: v.exp });
 }
 
 /* La page « merci » interroge ceci. Relance la vérification si le webhook
@@ -335,6 +414,8 @@ async function admin(url, env) {
 
   const brut = await env.SALONS.get('v:index');
   const liste = brut ? JSON.parse(brut) : [];
+  const ba = await env.SALONS.get('v:attente');
+  const attente = ba ? JSON.parse(ba) : [];
   const moisCourant = new Date().toISOString().slice(0, 7);
   const payantes = liste.filter(v => v.montant > 0);
   const caTotal = payantes.reduce((s, v) => s + v.montant, 0);
@@ -368,6 +449,24 @@ td{padding:11px;border-bottom:1px solid #F0F1F3}
 td.n{text-align:right;font-variant-numeric:tabular-nums;font-weight:700}
 .warn{background:#F5EDDE;color:#8E6B2F;border-radius:14px;padding:12px 14px;font-size:13.5px;
 font-weight:600;margin-bottom:14px}
+h2.st{font-size:17px;font-weight:800;margin:26px 0 6px;display:flex;align-items:center;gap:9px}
+.pill{background:#C99948;color:#241905;border-radius:999px;padding:2px 10px;font-size:12.5px}
+.aide{font-size:13.5px;color:#84878D;margin:0 0 12px}
+.att{background:#fff;border-radius:18px;padding:15px;margin-bottom:10px;
+box-shadow:0 1px 3px rgba(27,28,30,.06);border-left:4px solid #C99948}
+.att .hd{display:flex;justify-content:space-between;align-items:baseline;gap:10px}
+.att .hd b{font-size:16.5px}
+.att .mt{font-size:18px;font-weight:800;font-variant-numeric:tabular-nums;white-space:nowrap}
+.att .mn{font-size:13px;color:#84878D;margin-top:3px}
+.att .rf{font-size:14px;margin-top:9px;background:#F2F3F5;border-radius:12px;padding:9px 12px;
+word-break:break-all}
+.att .ac{display:flex;gap:9px;margin-top:12px}
+.att button{flex:1;border:none;border-radius:999px;padding:12px;font-size:14.5px;font-weight:700;
+font-family:inherit;cursor:pointer;min-height:46px}
+.att .ok{background:#051D38;color:#fff}
+.att .no{background:#F2F3F5;color:#C0392B}
+.fait{background:#E6F4EC;color:#14512C;border-radius:16px;padding:14px;font-size:14.5px;
+font-weight:600;margin-bottom:10px}
 </style></head><body>
 <h1>Ventes Jaraba</h1>
 <div class="k">
@@ -378,8 +477,38 @@ font-weight:600;margin-bottom:14px}
 </div>
 ${bientot.length ? '<div class="warn">' + bientot.length
   + ' licence(s) arrivent à échéance ce mois-ci — c\'est le moment de relancer.</div>' : ''}
+
+${attente.length ? `<h2 class="st">Paiements à confirmer <span class="pill">${attente.length}</span></h2>
+<p class="aide">Vérifiez que la somme est bien arrivée sur votre Mobile Money, puis confirmez :
+la clé part alors toute seule chez le client, qui la voit apparaître sur sa page.</p>
+${attente.map(a => `<div class="att" id="a-${esc(a.id)}">
+  <div class="hd"><b>${esc(a.etab)}</b><span class="mt">${fmtF(a.montant)}</span></div>
+  <div class="mn">${esc(a.formule)} · ${esc(a.tel)} · ${esc((a.date || '').slice(0, 10))}</div>
+  <div class="rf">Référence donnée : <b>${esc(a.refPaie)}</b></div>
+  <div class="ac">
+    <button class="ok" onclick="tranche('${esc(a.id)}',false)">J'ai reçu l'argent</button>
+    <button class="no" onclick="tranche('${esc(a.id)}',true)">Refuser</button>
+  </div></div>`).join('')}` : ''}
+
+<h2 class="st">Historique</h2>
 <table><tr><th>Date</th><th>Établissement</th><th>Téléphone</th><th>Formule</th>
 <th style="text-align:right">Montant</th><th>Fin</th></tr>${lignes}</table>
+<script>
+var CLE = new URLSearchParams(location.search).get('k');
+function tranche(id, refus){
+  if(refus && !confirm('Refuser cette demande ?')) return;
+  var bloc = document.getElementById('a-' + id);
+  bloc.style.opacity = '.5';
+  fetch('/vente/valider?k=' + encodeURIComponent(CLE), {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({id:id, refuser:refus})
+  }).then(function(r){ return r.json(); }).then(function(j){
+    if(j.ok){ bloc.outerHTML = '<div class="fait">' + (refus ? 'Refusé.'
+      : 'Licence délivrée jusqu\\'à fin ' + j.exp + ' — le client la reçoit à l\\'instant.') + '</div>'; }
+    else { bloc.style.opacity = '1'; alert(j.erreur || 'Impossible.'); }
+  }).catch(function(){ bloc.style.opacity = '1'; alert('Pas de réseau.'); });
+}
+</script>
 </body></html>`);
 }
 
@@ -395,7 +524,15 @@ export default {
     try {
       /* ---------------- tunnel de vente ---------------- */
       if (chemin === '/vente/tarifs' && req.method === 'GET')
-        return json(200, { devise: DEVISE, formules: FORMULES });
+        return json(200, {
+          devise: DEVISE, formules: FORMULES,
+          /* « auto » dès qu'un encaisseur est configuré, « direct » sinon */
+          paiement: (env.CINETPAY_KEY && env.CINETPAY_SITE) ? 'auto' : 'direct',
+          momo: env.MOMO_NUMERO || MOMO_DEFAUT.numero,
+          momoNom: env.MOMO_NOM || MOMO_DEFAUT.nom
+        });
+      if (chemin === '/vente/declarer' && req.method === 'POST') return declarer(req, env);
+      if (chemin === '/vente/valider'  && req.method === 'POST') return valider(u, req, env);
       if (chemin === '/vente/essai'  && req.method === 'POST') return essai(req, env);
       if (chemin === '/vente/acheter'&& req.method === 'POST') return acheter(req, env, u.origin);
       if (chemin === '/vente/notify' && req.method === 'POST') return notify(req, env);
