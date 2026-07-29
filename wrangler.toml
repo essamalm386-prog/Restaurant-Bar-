@@ -9,7 +9,8 @@
 # endroit, et il traite ses requêtes l'une après l'autre. C'est ce qui empêche
 # deux commandes simultanées de s'écraser, et ce qui permet de garder une
 # ligne ouverte vers le téléphone du gérant.
-name = "barresto"
+
+name = "restaurantbar"
 main = "worker.js"
 compatibility_date = "2025-05-05"
 
