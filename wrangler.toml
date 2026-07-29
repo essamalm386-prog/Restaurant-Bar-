@@ -1,7 +1,28 @@
+# Jaraba — configuration du Worker
+#
+# Ce fichier accompagne worker.js dans le dépôt GitHub relié à Cloudflare.
+# Deux réservoirs y sont déclarés :
+#   SALONS  le stockage réparti, qui garde les ventes et les licences
+#   SALON   un objet durable par bar, qui porte sa carte et ses commandes
+#
+# Le second est la nouveauté : il n'existe qu'un objet par bar, en un seul
+# endroit, et il traite ses requêtes l'une après l'autre. C'est ce qui empêche
+# deux commandes simultanées de s'écraser, et ce qui permet de garder une
+# ligne ouverte vers le téléphone du gérant.
 name = "barresto"
 main = "worker.js"
-compatibility_date = "2024-11-01"
+compatibility_date = "2025-05-05"
 
 [[kv_namespaces]]
 binding = "SALONS"
 id = "c464b37e1df54f30a0d99153bc7f3b2a"
+
+[[durable_objects.bindings]]
+name = "SALON"
+class_name = "SalonDurable"
+
+# La migration déclare la classe à Cloudflare. « sqlite » est le format
+# disponible sur le plan gratuit ; ne changez pas ce bloc une fois déployé.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SalonDurable"]
